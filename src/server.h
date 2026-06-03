@@ -1,35 +1,35 @@
 #pragma once
 // server.h — Cross-platform Event Loop 
-
 #include <functional>
 #include <unordered_map>
 #include <cstdint>
 
-# Platform-specific event flags 
-static constexpr uint32_t EV_READ     = 0x001;  # fd has data to read
-static constexpr uint32_t EV_WRITE    = 0x002;  # fd ready to write
-static constexpr uint32_t EV_EDGE     = 0x004;  # edge-triggered mode
-static constexpr uint32_t EV_HANGUP   = 0x008;  # peer closed connection
-static constexpr uint32_t EV_ERROR    = 0x010;  # error on fd
+//  Platform-specific event flags 
+static constexpr uint32_t EV_READ     = 0x001;  // fd has data to read
+static constexpr uint32_t EV_WRITE    = 0x002;  // fd ready to write
+static constexpr uint32_t EV_EDGE     = 0x004;  // edge-triggered mode
+static constexpr uint32_t EV_HANGUP   = 0x008;  // peer closed connection
+static constexpr uint32_t EV_ERROR    = 0x010;  // error on fd
 
 class EventLoop {
 public:
-    # Handler: called when fd is ready
+    // Handler: called when fd is ready
+    // events: bitmask of EV_READ | EV_HANGUP | EV_ERROR etc.
     using Handler = std::function<void(int fd, uint32_t events)>;
-   # events like bitmask of EV_READ | EV_HANGUP | EV_ERROR etc.
+
     EventLoop();
     ~EventLoop();
 
-    # Register fd, call handler when events fire
+    // Register fd, call handler when events fire
     void add_fd(int fd, uint32_t events, Handler handler);
 
-    # Change which events to watch 
+    // Change which events to watch 
     void mod_fd(int fd, uint32_t events);
 
-    # Stop watching fd (on disconnect / close)
+    // Stop watching fd 
     void del_fd(int fd);
 
-    # Main loop, blocks until stop() is called
+    // Main loop, blocks until stop() is called
     void run();
 
     void stop() { running_ = false; }
@@ -42,5 +42,5 @@ private:
     static constexpr int MAX_EVENTS = 1024;
 };
 
-# Create TCP listening socket on port 
+// Create TCP listening socket on port 
 int create_server_socket(int port);
