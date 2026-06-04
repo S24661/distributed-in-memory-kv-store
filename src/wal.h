@@ -8,6 +8,7 @@
 #include <atomic>
 #include <fstream>
 #include <cstdio>
+#include <sys/stat.h>
 
 class WAL {
 public:
@@ -19,8 +20,13 @@ public:
     // Log a command to the WAL buffer
     void log(const std::vector<std::string>& cmd);
 
+    struct ReplayEntry {
+        std::vector<std::string> cmd;
+        int64_t ttl_remaining_secs = -1;
+    };
+
     // Replay the WAL file on startup.
-    std::vector<std::vector<std::string>> replay();
+    std::vector<ReplayEntry> replay();
 
     // Force immediate fsync 
     void flush_now();
