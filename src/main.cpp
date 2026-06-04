@@ -406,7 +406,7 @@ int main(int argc, char* argv[]) {
     WAL      wal(cfg.wal_path, 2);
 
     // Restore state from WAL
-    for (const auto& cmd : wal.replay()) {
+    for (const auto& entry : wal.replay()) {
         const auto& cmd = entry.cmd;
         if (cmd.empty()) continue;
         std::string name = cmd[0];
