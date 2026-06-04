@@ -72,7 +72,7 @@ and async primary-replica replication — the same core ideas behind Redis, Post
 | `src/rdb.h/cpp` | Binary point-in-time snapshot — used for initial replica sync |
 | `src/replication.h/cpp` | Primary-side replication — `RingBuffer` backlog, per-replica sender threads, `PSYNC` handler |
 | `src/replica_client.h/cpp` | Replica-side replication — PSYNC handshake, RDB load, streaming loop, auto-reconnect |
-| `tests/test_all.cpp` | 47 unit tests — store, TTL, concurrency, eviction, RESP, WAL, RDB, replication |
+| `tests/test_all.cpp` | 50 unit tests — store, TTL, concurrency, eviction, RESP, WAL, RDB, replication |
 | `bench/benchmark.sh` | `redis-benchmark` harness comparing kvstore vs real Redis |
 
 ---
@@ -318,7 +318,7 @@ Expected output:
   [✓] Primary-replica full sync
   ...
 
-Results: 47/47 passed ✓
+Results: 50/50 passed ✓
 ```
 
 ---
