@@ -33,12 +33,12 @@ size_t Store::hash_key(const std::string& key) const {
         hash ^= c;                            // XOR with byte
         hash *= 1099511628211ULL;             // FNV prime
     }
-    return hash & (num_buckets_ - 1);  // fast modulo
+    return hash & (num_buckets_.load(std::memory_order_relaxed) - 1);
 }
 
 // STRIPE SELECTION
 size_t Store::stripe_of(size_t bucket) const {
-    return (bucket * NUM_STRIPES) / num_buckets_;
+    return (bucket * NUM_STRIPES) / num_buckets_.load(std::memory_order_relaxed);
 }
 
 // EXPIRY CHECK
@@ -47,20 +47,144 @@ bool Store::is_expired(const Entry& e) const {
     return e.expiry < steady_clock::now();
 }
 
+// INSERT_LOCKED — Internal insert, all stripe locks held by caller
+void Store::insert_locked(const std::string& key, const std::string& val,
+                          bool has_expiry,
+                          steady_clock::time_point expiry)
+{
+    const size_t nb = num_buckets_.load(std::memory_order_relaxed);
+
+    size_t home = hash_key(key);
+
+    // Check if key already exists in neighbourhood
+    uint8_t bmap = table_[home].hop_bitmap;
+    for (int i = 0; i < (int)NEIGHBOURHOOD; i++) {
+        if (!(bmap & (1 << i))) continue;
+        size_t idx = (home + i) & (nb - 1);
+        if (table_[idx].occupied && table_[idx].key == key) {
+            table_[idx].value      = val;
+            table_[idx].has_expiry = has_expiry;
+            table_[idx].expiry     = expiry;
+            return;
+        }
+    }
+
+    // Find nearest empty slot
+    size_t empty_pos = SIZE_MAX;
+    for (size_t i = 0; i < nb; i++) {
+        size_t idx = (home + i) & (nb - 1);
+        if (!table_[idx].occupied) {
+            empty_pos = idx;
+            break;
+        }
+    }
+
+    if (empty_pos == SIZE_MAX) {
+        std::cerr << "[store] insert_locked: no empty slot after resize — dropping key\n";
+        return;
+    }
+
+    // Hopscotch displacement
+    while (true) {
+        size_t dist = (empty_pos - home + nb) & (nb - 1);
+        if (dist < NEIGHBOURHOOD) break;
+
+        bool displaced = false;
+        for (int j = (int)NEIGHBOURHOOD - 1; j >= 1; j--) {
+            size_t cand      = (empty_pos - j + nb) & (nb - 1);
+            if (!table_[cand].occupied) continue;
+            size_t cand_home = hash_key(table_[cand].key);
+            size_t new_dist  = (empty_pos - cand_home + nb) & (nb - 1);
+            if (new_dist < NEIGHBOURHOOD) {
+                table_[empty_pos] = std::move(table_[cand]);
+                table_[cand].occupied = false;
+                size_t old_d = (cand      - cand_home + nb) & (nb - 1);
+                size_t new_d = (empty_pos - cand_home + nb) & (nb - 1);
+                table_[cand_home].hop_bitmap &= ~(1 << old_d);
+                table_[cand_home].hop_bitmap |=  (1 << new_d);
+                empty_pos = cand;
+                displaced = true;
+                break;
+            }
+        }
+        if (!displaced) {
+            std::cerr << "[store] insert_locked: displacement failed after resize — dropping key\n";
+            return;
+        }
+    }
+
+    size_t final_dist = (empty_pos - home + nb) & (nb - 1);
+    if (final_dist < NEIGHBOURHOOD) {
+        table_[empty_pos].key        = key;
+        table_[empty_pos].value      = val;
+        table_[empty_pos].occupied   = true;
+        table_[empty_pos].has_expiry = has_expiry;
+        table_[empty_pos].hop_bitmap = 0;
+        table_[empty_pos].expiry     = expiry;
+        table_[home].hop_bitmap     |= (1 << final_dist);
+        num_entries_++;
+    }
+}
+
+// DO_RESIZE_LOCKED — Double the table, rehash all entries
+
+void Store::do_resize_locked() {
+    size_t old_buckets = num_buckets_.load(std::memory_order_relaxed);
+    size_t new_buckets = old_buckets * 2;  // always power-of-2
+
+    std::cout << "[store] Resizing table: " << old_buckets
+              << " → " << new_buckets << " buckets\n";
+
+    // Collect all live entries before we overwrite the table
+    struct Snapshot { std::string key, val; bool has_expiry; steady_clock::time_point expiry; };
+    std::vector<Snapshot> live;
+    live.reserve(num_entries_.load());
+
+    for (size_t b = 0; b < old_buckets; b++) {
+        const Entry& e = table_[b];
+        if (!e.occupied || is_expired(e)) continue;
+        live.push_back({e.key, e.value, e.has_expiry, e.expiry});
+    }
+
+    // Replace table with a fresh, empty one of double size.
+    num_buckets_.store(new_buckets, std::memory_order_release);
+    table_.assign(new_buckets, Entry{});
+    num_entries_ = 0;
+
+    // Re-insert every live entry
+    for (auto& s : live)
+        insert_locked(s.key, s.val, s.has_expiry, s.expiry);
+
+    std::cout << "[store] Resize complete: " << num_entries_.load()
+              << " keys rehashed\n";
+}
 // SET — Insert or update a key
 void Store::set(const std::string& key, const std::string& val,
                 std::optional<int> ttl_seconds)
 {
+    size_t entries     = num_entries_.load(std::memory_order_relaxed);
+    size_t cur_buckets = num_buckets_.load(std::memory_order_acquire);
+    if (entries * 100 / cur_buckets >= MAX_LOAD_FACTOR) {
+        // Acquire all stripe write-locks before resizing
+        std::vector<std::unique_lock<std::shared_mutex>> all_locks;
+        all_locks.reserve(NUM_STRIPES);
+        for (auto& s : stripes_) all_locks.emplace_back(s);
+        // Re-check now that we hold all locks 
+        if (num_entries_.load() * 100 / num_buckets_.load(std::memory_order_relaxed) >= MAX_LOAD_FACTOR)
+            do_resize_locked();
+        // all_locks destructs here, releasing every stripe
+    }
     size_t home   = hash_key(key);
     size_t stripe = stripe_of(home);
 
     std::unique_lock lock(stripes_[stripe]);
-
+    const size_t nb = num_buckets_.load(std::memory_order_relaxed);
+    
     // Check if key already exists in neighbourhood 
     uint8_t bmap = table_[home].hop_bitmap;
     for (int i = 0; i < (int)NEIGHBOURHOOD; i++) {
         if (!(bmap & (1 << i))) continue;  // slot i not used by home
-        size_t idx = (home + i) & (num_buckets_ - 1);
+        size_t idx = (home + i) & (nb - 1);
         if (table_[idx].occupied && table_[idx].key == key) {
             // Found — update value and TTL
             table_[idx].value = val;
@@ -77,50 +201,64 @@ void Store::set(const std::string& key, const std::string& val,
 
     //  Find nearest empty slot 
     size_t empty_pos = SIZE_MAX;
-    for (size_t i = 0; i < num_buckets_; i++) {
-        size_t idx = (home + i) & (num_buckets_ - 1);
+    for (size_t i = 0; i < nb; i++) {
+        size_t idx = (home + i) & (nb - 1);
         if (!table_[idx].occupied || is_expired(table_[idx])) {
             // Treat expired entries as empty
-            table_[idx].occupied = false;
-            table_[idx].hop_bitmap = 0;
+            if (table_[idx].occupied) {
+                // Clear the stale hop_bitmap bit from this expired entry's home
+                size_t exp_home = hash_key(table_[idx].key);
+                size_t exp_dist = (idx - exp_home + nb) & (nb - 1);
+                if (exp_dist < NEIGHBOURHOOD)
+                    table_[exp_home].hop_bitmap &= ~(1 << exp_dist);
+                table_[idx].occupied = false;
+                table_[idx].hop_bitmap = 0;
+                num_entries_--;
+            }
             empty_pos = idx;
             break;
         }
     }
 
     if (empty_pos == SIZE_MAX) {
-        std::cerr << "[redis-lite] Table full — flushing expired entries\n";
-        flushall();
-        table_[home] = {key, val, {}, ttl_seconds.has_value(), true, 1};
-        num_entries_++;
+        // Release the stripe lock, grab all locks, resize, then retry
+        lock.unlock();
+        {
+            std::vector<std::unique_lock<std::shared_mutex>> all_locks;
+            all_locks.reserve(NUM_STRIPES);
+            for (auto& s : stripes_) all_locks.emplace_back(s);
+            do_resize_locked();
+        }
+        // Tail-call: retry now that the table is larger.
+        set(key, val, ttl_seconds);
         return;
     }
 
     // Hopscotch displacement
     while (true) {
         // Distance from home to empty slot
-        size_t dist = (empty_pos - home + num_buckets_) & (num_buckets_ - 1);
+        size_t dist = (empty_pos - home + nb) & (nb- 1);
         if (dist < NEIGHBOURHOOD) break;  // empty is close enough
 
         // Try to find an entry near empty_pos that can move into it
         bool displaced = false;
         for (int j = (int)NEIGHBOURHOOD - 1; j >= 1; j--) {
             // Candidate: j slots before empty_pos
-            size_t cand = (empty_pos - j + num_buckets_) & (num_buckets_ - 1);
+            size_t cand = (empty_pos - j + nb) & (nb - 1);
             if (!table_[cand].occupied) continue;
 
             size_t cand_home = hash_key(table_[cand].key);
 
-            size_t new_dist = (empty_pos - cand_home + num_buckets_)
-                             & (num_buckets_ - 1);
+            size_t new_dist = (empty_pos - cand_home + nb)
+                             & (nb - 1);
             if (new_dist < NEIGHBOURHOOD) {
                 // Move candidate from 'cand' to 'empty_pos'
                 table_[empty_pos] = std::move(table_[cand]);
                 table_[cand].occupied = false;
 
                 // Update hop_bitmap of cand_home
-                size_t old_d = (cand      - cand_home + num_buckets_) & (num_buckets_ - 1);
-                size_t new_d = (empty_pos - cand_home + num_buckets_) & (num_buckets_ - 1);
+                size_t old_d = (cand      - cand_home + nb) & (nb - 1);
+                size_t new_d = (empty_pos - cand_home + nb) & (nb - 1);
                 table_[cand_home].hop_bitmap &= ~(1 << old_d);
                 table_[cand_home].hop_bitmap |=  (1 << new_d);
 
@@ -131,13 +269,21 @@ void Store::set(const std::string& key, const std::string& val,
         }
 
         if (!displaced) {
-            std::cerr << "[redis-lite] Displacement failed — consider resize\n";
-            break;
+           // Release stripe lock, resize the entire table, then retry.
+            lock.unlock();
+            {
+                std::vector<std::unique_lock<std::shared_mutex>> all_locks;
+                all_locks.reserve(NUM_STRIPES);
+                for (auto& s : stripes_) all_locks.emplace_back(s);
+                do_resize_locked();
+            }
+            set(key, val, ttl_seconds);
+            return;
         }
     }
 
     //  Place new entry 
-    size_t final_dist = (empty_pos - home + num_buckets_) & (num_buckets_ - 1);
+    size_t final_dist = (empty_pos - home + nb) & (nb - 1);
     if (final_dist < NEIGHBOURHOOD) {
         table_[empty_pos].key        = key;
         table_[empty_pos].value      = val;
@@ -286,13 +432,14 @@ void Store::purge_loop() {
     while (running_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (!running_) break;
-
+        
+        const size_t nb = num_buckets_.load(std::memory_order_acquire);
         size_t purged = 0;
-        for (size_t bucket = 0; bucket < num_buckets_; bucket++) {
+        for (size_t bucket = 0; bucket < nb; bucket++) {
             size_t stripe = stripe_of(bucket);
 
             // Only lock one stripe at a time to avoid holding all locks
-            std::unique_lock lock(stripes_[stripe]);
+            std::unique_lock lock(stripes_[bucket_stripe]);
 
             if (!table_[bucket].occupied) continue;
             if (!table_[bucket].has_expiry) continue;
@@ -300,9 +447,35 @@ void Store::purge_loop() {
 
             // Expire this entry
             size_t home = hash_key(table_[bucket].key);
-            size_t dist = (bucket - home + num_buckets_) & (num_buckets_ - 1);
-            if (dist < NEIGHBOURHOOD)
-                table_[home].hop_bitmap &= ~(1 << dist);
+            size_t home_stripe = stripe_of(home);
+            size_t dist = (bucket - home + nb) & (nb - 1);
+           if (dist < NEIGHBOURHOOD) {
+                if (home_stripe == bucket_stripe) {
+                    table_[home].hop_bitmap &= ~(1 << dist);
+                } else {
+                    lock.unlock();
+
+                    size_t lo = std::min(home_stripe, bucket_stripe);
+                    size_t hi = std::max(home_stripe, bucket_stripe);
+                    std::unique_lock lock_lo(stripes_[lo]);
+                    std::unique_lock lock_hi(stripes_[hi]);
+
+                    // Re-validate
+                    if (!table_[bucket].occupied ||
+                        !table_[bucket].has_expiry ||
+                        !is_expired(table_[bucket])) {
+                        continue;  // entry changed, skip
+                    }
+                    
+                    table_[home].hop_bitmap &= ~(1 << dist);
+                    table_[bucket].occupied   = false;
+                    table_[bucket].has_expiry = false;
+                    table_[bucket].key.clear();
+                    num_entries_--;
+                    purged++;
+                    continue;
+                }
+            }
 
             table_[bucket].occupied   = false;
             table_[bucket].has_expiry = false;
@@ -320,7 +493,7 @@ void Store::purge_loop() {
 void Store::snapshot(SnapshotFn fn) {
     using namespace std::chrono;
 
-    for (size_t bucket = 0; bucket < num_buckets_; bucket++) {
+    for (size_t bucket = 0; bucket < nb; bucket++) {
         size_t stripe = stripe_of(bucket);
         std::shared_lock lock(stripes_[stripe]);
 
