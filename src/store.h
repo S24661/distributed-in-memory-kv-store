@@ -59,9 +59,9 @@ public:
     void snapshot(SnapshotFn fn);
 
 private:
-    std::vector<Entry>                        table_;
-    size_t                                    num_buckets_;
-    std::atomic<size_t>                       num_entries_{0};
+    std::vector<Entry>                 table_;
+    std::atomic<size_t>                num_buckets_;
+    std::atomic<size_t>                num_entries_{0};
 
     // 16 independent reader-writer locks
     std::array<std::shared_mutex, NUM_STRIPES> stripes_;
@@ -75,5 +75,11 @@ private:
     size_t        hash_key(const std::string& key) const;
     size_t        stripe_of(size_t bucket) const;
     bool          is_expired(const Entry& e) const;
-    void          do_resize();
+    // Table resize — called when displacement fails at high load
+    void          do_resize_locked();
+    // Internal set that assumes all stripe locks are already held
+    void          insert_locked(const std::string& key,
+                                const std::string& val,
+                                bool has_expiry,
+                                std::chrono::steady_clock::time_point expiry);
 };
