@@ -59,8 +59,8 @@ public:
     void snapshot(SnapshotFn fn);
 
 private:
-    std::vector<Entry>                 table_;
     std::atomic<size_t>                num_buckets_;
+    std::vector<Entry>                 table_;
     std::atomic<size_t>                num_entries_{0};
 
     // 16 independent reader-writer locks
