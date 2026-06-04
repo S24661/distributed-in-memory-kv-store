@@ -279,6 +279,7 @@ void test_eviction() {
     // At least one of x,y should no longer be cached
     bool x_cached = ev3.is_cached("x");
     bool y_cached = ev3.is_cached("y");
+    (void)x_cached; (void)y_cached;
     assert(!x_cached || !y_cached);  // at least one evicted
     PASS();
 
@@ -390,6 +391,7 @@ void test_wal() {
     PASS();
 
     TEST("WAL persists across restart (state reconstruction)");
+    Store store;
     for (const auto& entry : entries) {
         const auto& cmd = entry.cmd;
         if (entry.ttl_remaining_secs == 0) continue;  // already expired
@@ -477,7 +479,7 @@ void test_rdb() {
     TEST("RDB save and load file");
     RDB::save_to_file(rdb_path, s1);
     Store s3;
-    assert(RDB::load_from_file(rdb_path, s3))
+    assert(RDB::load_from_file(rdb_path, s3));
     assert(s3.get("name") == "John");
     assert(s3.dbsize() == 3);
     PASS();
