@@ -89,20 +89,29 @@ void WAL::stop() {
 }
 
 // REPLAY — Read WAL on startup, return all commands
-std::vector<std::vector<std::string>> WAL::replay() {
-    std::vector<std::vector<std::string>> commands;
+std::vector<WAL::ReplayEntry> WAL::replay() {
+    std::vector<ReplayEntry> commands;
     std::ifstream in(path_, std::ios::binary);
     if (!in.is_open()) {
         std::cout << "[WAL] No existing WAL — starting fresh\n";
         return commands;  // fresh start
     }
+    int64_t elapsed_secs = 0;
+    {
+        struct stat st{};
+        if (::stat(path_.c_str(), &st) == 0) {
+            auto file_mtime = std::chrono::system_clock::from_time_t(st.st_mtime);
+            auto now        = std::chrono::system_clock::now();
+            elapsed_secs    = std::chrono::duration_cast<std::chrono::seconds>(
+                                  now - file_mtime).count();
+            if (elapsed_secs < 0) elapsed_secs = 0;  // clock skew guard
+        }
+        // If stat fails, elapsed_secs stays 0 
+    }
 
     std::string line;
-    size_t line_num = 0;
 
     while (std::getline(in, line)) {
-        line_num++;
-        // Skip empty lines and non-array lines
         if (line.empty()) continue;
         if (line.back() == '\r') line.pop_back();  // handle \r\n
         if (line[0] != '*') continue;
@@ -127,12 +136,46 @@ std::vector<std::vector<std::string>> WAL::replay() {
             cmd.push_back(line);
         }
 
-        if (ok && (int)cmd.size() == count)
-            commands.push_back(std::move(cmd));
+       if (!ok || (int)cmd.size() != count) continue;
+
+        // Compute adjusted TTL for SET, EX N commands
+        int64_t ttl_remaining = -1;  // -1 = no TTL
+        if (!cmd.empty()) {
+            std::string name = cmd[0];
+            for (char& c : name) c = toupper(c);
+
+            if (name == "SET" && cmd.size() >= 3) {
+                for (size_t i = 3; i + 1 < cmd.size(); i++) {
+                    std::string flag = cmd[i];
+                    for (char& c : flag) c = toupper(c);
+                    int64_t orig_ttl = 0;
+                    if (flag == "EX") {
+                        try { orig_ttl = std::stoll(cmd[i + 1]); } catch (...) {}
+                        ttl_remaining = orig_ttl - elapsed_secs;
+                        break;
+                    } else if (flag == "PX") {
+                        try { orig_ttl = std::stoll(cmd[i + 1]) / 1000; } catch (...) {}
+                        ttl_remaining = orig_ttl - elapsed_secs;
+                        break;
+                    }
+                }
+            } else if (name == "EXPIRE" && cmd.size() == 3) {
+                int64_t orig_ttl = 0;
+                try { orig_ttl = std::stoll(cmd[2]); } catch (...) {}
+                ttl_remaining = orig_ttl - elapsed_secs;
+            }
+        }
+
+        commands.push_back({std::move(cmd), ttl_remaining});
     }
 
+    size_t skipped = 0;
+    for (const auto& e : commands)
+        if (e.ttl_remaining_secs == 0) skipped++;
+
     std::cout << "[WAL] Replayed " << commands.size()
-              << " commands from " << path_ << "\n";
+              << " commands from " << path_
+              << " (" << skipped << " already expired)\n";
     return commands;
 }
 
