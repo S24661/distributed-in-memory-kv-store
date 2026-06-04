@@ -186,7 +186,7 @@ void Store::set(const std::string& key, const std::string& val,
         if (!(bmap & (1 << i))) continue;  // slot i not used by home
         size_t idx = (home + i) & (nb - 1);
         if (table_[idx].occupied && table_[idx].key == key) {
-            // Found — update value and TTL
+            // Found, update value and TTL
             table_[idx].value = val;
             if (ttl_seconds) {
                 table_[idx].has_expiry = true;
@@ -436,7 +436,7 @@ void Store::purge_loop() {
         const size_t nb = num_buckets_.load(std::memory_order_acquire);
         size_t purged = 0;
         for (size_t bucket = 0; bucket < nb; bucket++) {
-            size_t stripe = stripe_of(bucket);
+            size_t bucket_stripe = stripe_of(bucket);
 
             // Only lock one stripe at a time to avoid holding all locks
             std::unique_lock lock(stripes_[bucket_stripe]);
@@ -493,6 +493,7 @@ void Store::purge_loop() {
 void Store::snapshot(SnapshotFn fn) {
     using namespace std::chrono;
 
+    const size_t nb = num_buckets_.load(std::memory_order_acquire);
     for (size_t bucket = 0; bucket < nb; bucket++) {
         size_t stripe = stripe_of(bucket);
         std::shared_lock lock(stripes_[stripe]);
