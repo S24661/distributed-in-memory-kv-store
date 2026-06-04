@@ -330,18 +330,36 @@ void handle_client(int fd, Store& store, ClockPro& eviction,
 
         //  INFO
         else if (cmd[0] == "INFO") {
+
+#if defined(__APPLE__)
+            const char* os_str   = "macOS";
+#else
+            const char* os_str   = "Linux";
+#endif
+#if defined(__aarch64__) || defined(__arm64__)
+            const char* arch_str = "aarch64";
+#elif defined(__x86_64__) || defined(_M_X64)
+            const char* arch_str = "x86_64";
+#else
+            const char* arch_str = "unknown";
+#endif
+#if defined(__APPLE__)
+            const char* io_str   = "kqueue-edge-triggered";
+#else
+            const char* io_str   = "epoll-edge-triggered";
+#endif
             std::string info =
-                "# Server\r\n"
-                "server_name:redis-lite\r\n"
-                "version:2.0.0\r\n"
-                "os:Linux\r\n"
-                "architecture:x86_64\r\n"
-                "# Storage\r\n"
-                "hash_table:hopscotch\r\n"
-                "eviction_policy:clock-pro\r\n"
-                "io_model:epoll-edge-triggered\r\n"
-                "persistence:wal-group-commit\r\n"
-                "keys:" + std::to_string(store.dbsize()) + "\r\n"
+                std::string("# Server\r\n")
+                + "server_name:redis-lite\r\n"
+                + "version:2.0.0\r\n"
+                + "os:" + os_str + "\r\n"
+                + "architecture:" + arch_str + "\r\n"
+                + "# Storage\r\n"
+                + "hash_table:hopscotch\r\n"
+                + "eviction_policy:clock-pro\r\n"
+                + "io_model:" + io_str + "\r\n"
+                + "persistence:wal-group-commit\r\n"
+                + "keys:" + std::to_string(store.dbsize()) + "\r\n"
                 + build_replication_info();
             response = RespParser::bulk(info);
         }
@@ -373,8 +391,8 @@ int main(int argc, char* argv[]) {
     ServerConfig cfg = parse_args(argc, argv);
     g_is_replica = cfg.is_replica;
 
-    std::cout << "╔═══════════════════════════════════════════╗\n";
-    std::cout << "║      distributed-in-memory-kv-store v1.0       ║\n";
+    std::cout << "╔══════════════════════════════════════════════╗\n";
+    std::cout << "║      distributed-in-memory-kv-store v1.0     ║\n";
     std::cout << "║  Hash: Hopscotch  Eviction: CLOCK-Pro        ║\n";
     std::cout << "║  I/O: epoll ET    WAL: Group Commit          ║\n";
     std::cout << "║  Replication: Async Primary-Replica          ║\n";
@@ -389,20 +407,37 @@ int main(int argc, char* argv[]) {
 
     // Restore state from WAL
     for (const auto& cmd : wal.replay()) {
+        const auto& cmd = entry.cmd;
         if (cmd.empty()) continue;
         std::string name = cmd[0];
         for (char& c : name) c = toupper(c);
         if (name == "SET" && cmd.size() >= 3) {
+            if (entry.ttl_remaining_secs == 0) continue;
+            
             std::optional<int> ttl;
-            for (size_t i = 3; i + 1 < cmd.size(); i++)
-                if (cmd[i] == "EX") ttl = std::stoi(cmd[i+1]);
+             if (entry.ttl_remaining_secs > 0)
+                ttl = static_cast<int>(entry.ttl_remaining_secs);
+            
             store.set(cmd[1], cmd[2], ttl);
             eviction.on_insert(cmd[1]);
         }
         else if (name == "DEL" && cmd.size() >= 2)
             for (size_t i = 1; i < cmd.size(); i++) store.del(cmd[i]);
-        else if (name == "EXPIRE" && cmd.size() == 3)
-            store.expire(cmd[1], std::stoi(cmd[2]));
+        else if (name == "EXPIRE" && cmd.size() == 3) {
+            // ttl_remaining_secs == 0: expiry already passed, delete the key.
+            if (entry.ttl_remaining_secs == 0) {
+                store.del(cmd[1]);
+            } else if (entry.ttl_remaining_secs > 0) {
+                store.expire(cmd[1], static_cast<int>(entry.ttl_remaining_secs));
+            }
+            // ttl_remaining_secs == -1 should not occur for expire
+        }
+        else if (name == "MSET" && cmd.size() >= 3 && cmd.size() % 2 == 1) {
+            for (size_t i = 1; i + 1 < cmd.size(); i += 2) {
+                store.set(cmd[i], cmd[i + 1]);
+                eviction.on_insert(cmd[i]);
+            }
+        }    
         else if (name == "FLUSHALL")
             store.flushall();
     }
