@@ -82,6 +82,43 @@ void test_store_basic() {
     s2.flushall();
     assert(s2.dbsize() == 0);
     PASS();
+
+    TEST("SET empty string value");
+    store.set("empty_val", "");
+    auto ev = store.get("empty_val");
+    assert(ev.has_value() && ev->empty());
+    PASS();
+
+    TEST("SET value with special characters");
+    store.set("special", "hello\nworld\t!");
+    assert(store.get("special") == "hello\nworld\t!");
+    PASS();
+
+    TEST("DBSIZE tracks count correctly across SET/DEL");
+    Store s3;
+    s3.set("k1", "v1");
+    s3.set("k2", "v2");
+    assert(s3.dbsize() == 2);
+    s3.del("k1");
+    assert(s3.dbsize() == 1);
+    s3.set("k2", "updated");  
+    assert(s3.dbsize() == 1);
+    s3.set("k3", "v3");
+    assert(s3.dbsize() == 2);
+    PASS();
+
+    TEST("Large-scale insert triggers resize and all keys survive");
+    Store big;
+    const int N = 50000;
+    for (int i = 0; i < N; i++)
+        big.set("resize_key:" + std::to_string(i), std::to_string(i));
+    assert(static_cast<int>(big.dbsize()) == N);
+    // Spot-check a sample of keys at different positions
+    for (int i : {0, 1, 999, 10000, 25000, 49999}) {
+        auto r = big.get("resize_key:" + std::to_string(i));
+        assert(r.has_value() && *r == std::to_string(i));
+    }
+    PASS();
 }
 
 void test_store_ttl() {
@@ -97,8 +134,7 @@ void test_store_ttl() {
 
     TEST("TTL returns remaining seconds");
     store.set("k", "v", 10);
-    int64_t t = store.ttl("k");
-    assert(t >= 8 && t <= 10);
+    assert(store.ttl("k") >= 8 && store.ttl("k") <= 10);
     PASS();
 
     TEST("TTL returns -1 for key without expiry");
@@ -115,6 +151,28 @@ void test_store_ttl() {
     assert(store.expire("key2", 1) == true);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     assert(!store.get("key2").has_value());
+    PASS();
+
+    TEST("EXPIRE returns false for missing key");
+    assert(store.expire("no_such_key", 10) == false);
+    PASS();
+
+    TEST("SET with TTL then overwrite removes TTL");
+    // Re-setting a key without TTL should remove the expiry
+    store.set("ttl_then_perm", "first", 1);
+    assert(store.ttl("ttl_then_perm") > 0);
+    store.set("ttl_then_perm", "second");  // no TTL this time
+    assert(store.ttl("ttl_then_perm") == -1);
+    // Key must still be alive after 1.1 s
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    assert(store.get("ttl_then_perm") == "second");
+    PASS();
+
+    TEST("EXISTS returns false for expired key");
+    store.set("exp_exists", "v", 1);
+    assert(store.exists("exp_exists") == true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    assert(store.exists("exp_exists") == false);
     PASS();
 }
 
@@ -161,6 +219,27 @@ void test_store_concurrent() {
     for (auto& th : mixed) th.join();
     // No crash and reads returned some values
     assert(read_count.load() > 0);
+    PASS();
+
+    TEST("Concurrent DEL and GET on same key (no crash, no stale read)");
+    store.set("concur_del", "alive");
+    std::atomic<bool> saw_stale{false};
+    std::vector<std::thread> del_threads;
+
+    std::atomic<bool> done{false};
+    del_threads.emplace_back([&]() {
+        for (int i = 0; i < 200; i++) store.set("concur_del", "v");
+        store.del("concur_del");
+        done = true;
+    });
+    for (int i = 0; i < 4; i++) {
+        del_threads.emplace_back([&]() {
+            while (!done) store.get("concur_del");
+        });
+    }
+    for (auto& th : del_threads) th.join();
+    if (store.get("concur_del").has_value()) saw_stale = true;
+    assert(!saw_stale);
     PASS();
 }
 
@@ -209,6 +288,22 @@ void test_eviction() {
     assert(ev4.is_cached("k"));
     ev4.on_delete("k");
     assert(!ev4.is_cached("k"));
+    PASS();
+
+    TEST("num_hot and num_cold reflect access pattern");
+    ClockPro ev5(10);
+    ev5.on_insert("h1");
+    ev5.on_insert("h2");
+    ev5.on_insert("c1");
+    ev5.on_access("h1"); ev5.on_access("h1");
+    ev5.on_access("h2"); ev5.on_access("h2");
+    assert(ev5.num_hot() >= 2);
+    assert(ev5.num_cold() >= 1);
+    PASS();
+
+    TEST("capacity() returns configured capacity");
+    ClockPro ev6(42);
+    assert(ev6.capacity() == 42);
     PASS();
 }
 
@@ -285,23 +380,45 @@ void test_wal() {
     }
 
     WAL wal2(test_path, 1);
-    auto cmds = wal2.replay();
-    assert(cmds.size() == 3);
-    assert(cmds[0][0] == "SET" && cmds[0][1] == "name");
-    assert(cmds[1][0] == "SET" && cmds[1][1] == "age");
-    assert(cmds[2][0] == "DEL" && cmds[2][1] == "name");
+    auto entries = wal2.replay();
+    assert(entries.size() == 3);
+    assert(entries[0].cmd[0] == "SET" && entries[0].cmd[1] == "name");
+    assert(entries[1].cmd[0] == "SET" && entries[1].cmd[1] == "age");
+    assert(entries[2].cmd[0] == "DEL" && entries[2].cmd[1] == "name");
+    assert(entries[0].ttl_remaining_secs == -1);
+    assert(entries[1].ttl_remaining_secs == -1);
     PASS();
 
     TEST("WAL persists across restart (state reconstruction)");
-    Store store;
-    for (const auto& cmd : cmds) {
-        if (cmd[0] == "SET" && cmd.size() >= 3) store.set(cmd[1], cmd[2]);
-        else if (cmd[0] == "DEL" && cmd.size() >= 2) store.del(cmd[1]);
+    for (const auto& entry : entries) {
+        const auto& cmd = entry.cmd;
+        if (entry.ttl_remaining_secs == 0) continue;  // already expired
+        if (cmd[0] == "SET" && cmd.size() >= 3) {
+            std::optional<int> ttl;
+            if (entry.ttl_remaining_secs > 0)
+                ttl = static_cast<int>(entry.ttl_remaining_secs);
+            store.set(cmd[1], cmd[2], ttl);
+        } else if (cmd[0] == "DEL" && cmd.size() >= 2) {
+            store.del(cmd[1]);
+        }
     }
-    // After replay: "name" was deleted, "age" remains
     assert(!store.get("name").has_value());
     assert(store.get("age") == "20");
     PASS();
+
+    TEST("WAL replay on empty file returns no entries");
+    const std::string empty_path = "/tmp/test_redis_lite_empty.aof";
+    ::unlink(empty_path.c_str());
+    {
+        WAL wempty(empty_path, 1);
+        wempty.flush_now();
+        wempty.stop();
+    }
+    WAL wreplay(empty_path, 1);
+    auto empty_entries = wreplay.replay();
+    assert(empty_entries.empty());
+    PASS();
+    ::unlink(empty_path.c_str());
 
     ::unlink(test_path.c_str());
 }
@@ -350,8 +467,7 @@ void test_rdb() {
     assert(!blob.empty());
 
     Store s2;
-    bool ok = RDB::deserialize(blob, s2);
-    assert(ok);
+    assert(RDB::deserialize(blob, s2));
     assert(s2.get("name") == "John");
     assert(s2.get("city") == "Roorkee");
     assert(s2.get("score") == "99");
@@ -361,8 +477,7 @@ void test_rdb() {
     TEST("RDB save and load file");
     RDB::save_to_file(rdb_path, s1);
     Store s3;
-    bool loaded = RDB::load_from_file(rdb_path, s3);
-    assert(loaded);
+    assert(RDB::load_from_file(rdb_path, s3))
     assert(s3.get("name") == "John");
     assert(s3.dbsize() == 3);
     PASS();
@@ -380,6 +495,17 @@ void test_rdb() {
     assert(!s5.get("temp").has_value());  // expired, should not be in RDB
     PASS();
 
+    TEST("RDB round-trip preserves value with spaces and unicode");
+    Store s6;
+    s6.set("greeting", "hello world");
+    s6.set("unicode",  "\xc3\xa9l\xc3\xa8ve");  // "élève" in UTF-8
+    auto blob3 = RDB::serialize(s6);
+    Store s7;
+    RDB::deserialize(blob3, s7);
+    assert(s7.get("greeting") == "hello world");
+    assert(s7.get("unicode")  == "\xc3\xa9l\xc3\xa8ve");
+    PASS();
+    
     ::unlink(rdb_path.c_str());
 }
 
@@ -391,15 +517,11 @@ void test_replication() {
     RingBuffer rb(1024);
     rb.write("hello");
     rb.write(" world");
-    int64_t cur = rb.current_offset();
-    assert(cur == 11);
+    assert(rb.current_offset() == 11);
 
     std::string out;
-    bool ok = rb.read(0, 5, out);
-    assert(ok && out == "hello");
-
-    ok = rb.read(6, 5, out);
-    assert(ok && out == "world");
+    assert(rb.read(0, 5, out) && out == "hello");
+    assert(rb.read(6, 5, out) && out == "world");
     PASS();
 
     TEST("RingBuffer contains_offset");
@@ -421,6 +543,23 @@ void test_replication() {
     assert(!rb3.read(0, 4, out2));   // overwritten
     assert(rb3.read(4, 4, out2));    // still valid: "5678"
     assert(out2 == "5678");
+    PASS();
+
+    TEST("RingBuffer current_offset advances monotonically");
+    RingBuffer rb4(64);
+    assert(rb4.current_offset() == 0);
+    rb4.write("abc");
+    assert(rb4.current_offset() == 3);
+    rb4.write("de");
+    assert(rb4.current_offset() == 5);
+    PASS();
+
+    TEST("RingBuffer read of exactly capacity bytes succeeds");
+    RingBuffer rb5(8);
+    rb5.write("ABCDEFGH");           // fill exactly
+    std::string out3;
+    assert(rb5.read(0, 8, out3));
+    assert(out3 == "ABCDEFGH");
     PASS();
 
     std::cout << "\n── Replication: Primary→Replica Integration ──\n";
@@ -457,5 +596,16 @@ void test_replication() {
     assert(info.connected_replicas == 0);
     assert(!info.repl_id.empty());
     assert(info.repl_id.size() == 40);
+    PASS();
+
+    TEST("ReplicationManager repl_offset advances after propagate");
+    Store mgr_store2;
+    ReplicationManager mgr2(mgr_store2);
+    int64_t offset_before = mgr2.repl_offset();
+    mgr2.propagate({"SET", "foo", "bar"});
+    int64_t offset_after = mgr2.repl_offset();
+    (void)offset_before;   
+    (void)offset_after;
+    assert(offset_after > offset_before);
     PASS();
 }
