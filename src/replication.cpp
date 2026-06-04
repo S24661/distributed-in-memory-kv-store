@@ -163,8 +163,11 @@ void ReplicationManager::propagate(const std::vector<std::string>& cmd) {
     std::lock_guard lock(replicas_mutex_);
     for (auto& replica : replicas_) {
         if (!replica->alive) continue;
-        std::lock_guard qlock(replica->queue_mutex);
-        replica->send_queue.push_back(serialised);
+        {
+            std::lock_guard qlock(replica->queue_mutex);
+            replica->send_queue.push_back(serialised);
+        }
+        replica->queue_cv.notify_one();  // wake sender thread immediately
     }
 }
 
@@ -173,10 +176,14 @@ void ReplicationManager::sender_loop(ReplicaConn* replica) {
     while (replica->alive) {
         std::deque<std::string> to_send;
         {
-            std::lock_guard lock(replica->queue_mutex);
+            std::unique_lock<std::mutex> lock(replica->queue_mutex);
+            replica->queue_cv.wait(lock, [replica] {
+                return !replica->send_queue.empty() || !replica->alive;
+            });
+            if (!replica->alive) break;
             std::swap(to_send, replica->send_queue);
-        }
-
+        }  // release queue_mutex before doing I/O
+        
         for (const auto& cmd : to_send) {
             ssize_t sent = send(replica->fd,
                                 cmd.c_str(), cmd.size(),
@@ -191,9 +198,6 @@ void ReplicationManager::sender_loop(ReplicaConn* replica) {
             }
             replica->offset += sent;
         }
-
-        if (to_send.empty())
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
