@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <thread>
 #include <unordered_map>
@@ -24,12 +25,14 @@ struct ReplicaConn {
     // Per-replica send queue 
     std::deque<std::string> send_queue;
     std::mutex              queue_mutex;
+    std::condition_variable queue_cv;
 
     ReplicaConn(int fd, const std::string& h, int p)
         : fd(fd), host(h), port(p) {}
 
     ~ReplicaConn() {
         alive = false;
+        queue_cv.notify_all();
         if (send_thread.joinable()) send_thread.join();
     }
 };
